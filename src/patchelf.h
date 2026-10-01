@@ -176,6 +176,8 @@ public:
 
     void addDebugTag();
 
+    void fixLayout();
+
     void buildResolutionCache();
 
     void renameDynamicSymbols(const std::unordered_map<std::string_view, std::string>&);

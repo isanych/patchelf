@@ -592,6 +592,101 @@ void ElfFile<ElfFileParamNames>::shiftFile(unsigned int extraPages, size_t start
 }
 
 
+/* Repair the file layout of binaries that were stripped (strip/objcopy) after
+   patchelf had added a PT_LOAD segment: stripping removes non-alloc sections
+   in front of that segment and moves its file offset down while its virtual
+   address stays, which breaks the congruence of p_offset and p_vaddr (the
+   loader refuses to map the file) and, for executables, the program headers
+   mapping that Linux < 5.18 relies on (AT_PHDR = load_bias + e_phoff).
+   Insert zero padding in front of the affected segments so that
+   p_offset == p_vaddr (- load bias) for the segment holding the program
+   headers of executables, and p_offset == p_vaddr (mod p_align) for all
+   others. Virtual addresses are not changed. */
+template<ElfFileParams>
+void ElfFile<ElfFileParamNames>::fixLayout()
+{
+    std::vector<size_t> loads;
+    for (size_t i = 0; i < phdrs.size(); ++i)
+        if (rdi(phdrs[i].p_type) == PT_LOAD)
+            loads.push_back(i);
+    if (loads.empty())
+        return;
+    std::sort(loads.begin(), loads.end(), [&](size_t a, size_t b) {
+        return rdi(phdrs[a].p_offset) < rdi(phdrs[b].p_offset);
+    });
+
+    const size_t phoff = rdi(hdr()->e_phoff);
+    const size_t phsize = phdrs.size() * sizeof(Elf_Phdr);
+    const Elf_Addr bias = rdi(phdrs[loads[0]].p_vaddr) - rdi(phdrs[loads[0]].p_offset);
+
+    /* (old file offset, cumulative shift of everything from that offset on) */
+    std::vector<std::pair<size_t, size_t>> cuts{{0, 0}};
+    size_t shift = 0, prevEnd = 0;
+    for (auto i : loads) {
+        auto & p = phdrs[i];
+        const size_t off = rdi(p.p_offset), filesz = rdi(p.p_filesz);
+        const size_t align = rdi(p.p_align);
+        const size_t vaddr = rdi(p.p_vaddr);
+        const size_t newOff = off + shift;
+        size_t extra = 0;
+        if (align > 1)
+            extra = (vaddr % align + align - newOff % align) % align;
+        if (isExecutable && phoff >= off && phoff + phsize <= off + filesz) {
+            if (vaddr - bias >= newOff)
+                extra = vaddr - bias - newOff;
+            else
+                debug("cannot move program headers to file offset 0x%llx\n", (unsigned long long) (vaddr - bias));
+        }
+        if (extra && off < prevEnd)
+            error("overlapping segments, cannot fix the layout");
+        shift += extra;
+        cuts.emplace_back(off, shift);
+        wri(p.p_offset, off + shift);
+        prevEnd = std::max(prevEnd, off + filesz);
+    }
+    if (shift == 0)
+        return;
+
+    auto shiftOf = [&](size_t off) {
+        size_t result = 0;
+        for (auto & c : cuts)
+            if (c.first <= off)
+                result = c.second;
+        return result;
+    };
+
+    auto old = *fileContents;
+    fileContents->assign(old.size() + shift, 0);
+    for (size_t k = 0; k < cuts.size(); ++k) {
+        const size_t from = cuts[k].first;
+        const size_t to = k + 1 < cuts.size() ? cuts[k + 1].first : old.size();
+        if (to > from)
+            memcpy(fileContents->data() + from + cuts[k].second, old.data() + from, to - from);
+    }
+
+    for (size_t i = 0; i < phdrs.size(); ++i)
+        if (rdi(phdrs[i].p_type) != PT_LOAD)
+            wri(phdrs[i].p_offset, rdi(phdrs[i].p_offset) + shiftOf(rdi(phdrs[i].p_offset)));
+    for (size_t i = 1; i < shdrs.size(); ++i) {
+        const size_t o = rdi(shdrs[i].sh_offset);
+        wri(shdrs[i].sh_offset, o + shiftOf(o));
+    }
+    const size_t shoff = rdi(hdr()->e_shoff);
+    wri(hdr()->e_shoff, shoff + shiftOf(shoff));
+    const size_t newPhoff = phoff + shiftOf(phoff);
+    wri(hdr()->e_phoff, newPhoff);
+
+    Elf_Addr phdrAddress = newPhoff + bias;
+    for (auto i : loads) {
+        const size_t o = rdi(phdrs[i].p_offset), f = rdi(phdrs[i].p_filesz);
+        if (newPhoff >= o && newPhoff < o + f)
+            phdrAddress = rdi(phdrs[i].p_vaddr) + (newPhoff - o);
+    }
+    changed = true;
+    rewriteHeaders(phdrAddress);
+}
+
+
 template<ElfFileParams>
 std::string ElfFile<ElfFileParamNames>::getSectionName(const Elf_Shdr & shdr) const
 {
@@ -2936,6 +3031,7 @@ static bool removeRPath = false;
 static bool setRPath = false;
 static bool addRPath = false;
 static bool addDebugTag = false;
+static bool fixLayout = false;
 static bool buildResolutionCache = false;
 static bool renameDynamicSymbols = false;
 static bool printRPath = false;
@@ -3005,6 +3101,9 @@ static void patchElf2(ElfFile && elfFile, const FileContents & fileContents, con
     if (addDebugTag)
         elfFile.addDebugTag();
 
+    if (fixLayout)
+        elfFile.fixLayout();
+
     if (buildResolutionCache)
         elfFile.buildResolutionCache();
 
@@ -3071,6 +3170,7 @@ static void showHelp(const std::string & progName)
   [--no-sort]\t\tDo not sort program+section headers; useful for debugging patchelf.\n\
   [--clear-symbol-version SYMBOL]\n\
   [--add-debug-tag]\n\
+  [--fix-layout]\t\tRepair PT_LOAD file offsets broken by strip after patchelf (insert padding)\n\
   [--build-resolution-cache]\n\
   [--print-execstack]\t\tPrints whether the object requests an executable stack\n\
   [--clear-execstack]\n\
@@ -3207,6 +3307,9 @@ static int mainWrapped(int argc, char * * argv)
         }
         else if (arg == "--add-debug-tag") {
             addDebugTag = true;
+        }
+        else if (arg == "--fix-layout") {
+            fixLayout = true;
         }
         else if (arg == "--build-resolution-cache") {
             buildResolutionCache = true;
